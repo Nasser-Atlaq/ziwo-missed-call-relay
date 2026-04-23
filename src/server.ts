@@ -3,9 +3,28 @@ import express from 'express';
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-const { TEAMS_WEBHOOK_URL, ZIWO_SHARED_SECRET, PORT = '3000' } = process.env;
-if (!TEAMS_WEBHOOK_URL || !ZIWO_SHARED_SECRET) {
-  throw new Error('Missing TEAMS_WEBHOOK_URL or ZIWO_SHARED_SECRET');
+const {
+  ENTRA_TENANT_ID,
+  ENTRA_CLIENT_ID,
+  ENTRA_CLIENT_SECRET,
+  ONEDRIVE_USER,
+  EXCEL_FILE_PATH,
+  EXCEL_TABLE_NAME,
+  ZIWO_SHARED_SECRET,
+  PORT = '3000',
+} = process.env;
+
+const required = {
+  ENTRA_TENANT_ID,
+  ENTRA_CLIENT_ID,
+  ENTRA_CLIENT_SECRET,
+  ONEDRIVE_USER,
+  EXCEL_FILE_PATH,
+  EXCEL_TABLE_NAME,
+  ZIWO_SHARED_SECRET,
+};
+for (const [k, v] of Object.entries(required)) {
+  if (!v) throw new Error(`Missing env var: ${k}`);
 }
 
 type ZiwoCallResult = 'Answered' | 'Busy' | 'Cancel' | 'Lose-race' | 'Failed' | 'Timeout';
@@ -22,65 +41,99 @@ interface ZiwoCallEnded {
   flags?: Record<string, unknown>;
 }
 
+let cachedToken: { token: string; expiresAt: number } | null = null;
+
+async function getGraphToken(): Promise<string> {
+  if (cachedToken && Date.now() < cachedToken.expiresAt - 60_000) {
+    return cachedToken.token;
+  }
+
+  const resp = await fetch(
+    `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: ENTRA_CLIENT_ID!,
+        client_secret: ENTRA_CLIENT_SECRET!,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials',
+      }),
+    },
+  );
+
+  if (!resp.ok) {
+    throw new Error(`Entra token fetch failed: ${resp.status} ${await resp.text()}`);
+  }
+
+  const data = (await resp.json()) as { access_token: string; expires_in: number };
+  cachedToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+  return cachedToken.token;
+}
+
+function encodeExcelPath(path: string): string {
+  const trimmed = path.startsWith('/') ? path.slice(1) : path;
+  return trimmed.split('/').map(encodeURIComponent).join('/');
+}
+
+async function appendMissedCallToExcel(event: ZiwoCallEnded): Promise<void> {
+  const token = await getGraphToken();
+
+  const localTime = new Date(event.startedAt).toLocaleString('en-GB', {
+    timeZone: 'Asia/Dubai',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  });
+
+  const row = [
+    localTime,
+    event.callerIdNumber,
+    event.callerIdName || 'Unknown',
+    event.calleeIdNumber || '',
+    event.callResult,
+    event.callID,
+    '',
+    '',
+  ];
+
+  const encodedPath = encodeExcelPath(EXCEL_FILE_PATH!);
+  const url =
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(ONEDRIVE_USER!)}` +
+    `/drive/root:/${encodedPath}:/workbook/tables/${encodeURIComponent(EXCEL_TABLE_NAME!)}/rows/add`;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ values: [row] }),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Excel append failed: ${resp.status} ${await resp.text()}`);
+  }
+}
+
 app.post('/ziwo/call-ended', async (req, res) => {
   if (req.query.token !== ZIWO_SHARED_SECRET) {
     return res.status(401).send('unauthorized');
   }
 
   const event = req.body as ZiwoCallEnded;
-
   console.log(JSON.stringify({ at: new Date().toISOString(), callID: event.callID, callResult: event.callResult }));
 
   if (event.callResult !== 'Cancel') {
     return res.status(200).send('ignored');
   }
 
-  const localTime = new Date(event.startedAt).toLocaleString('en-GB', {
-    timeZone: 'Asia/Dubai',
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  });
-
-  const card = {
-    type: 'message',
-    attachments: [{
-      contentType: 'application/vnd.microsoft.card.adaptive',
-      content: {
-        type: 'AdaptiveCard',
-        $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
-        version: '1.4',
-        body: [
-          { type: 'TextBlock', text: 'Missed Call', weight: 'Bolder', size: 'Medium', color: 'Attention' },
-          {
-            type: 'FactSet',
-            facts: [
-              { title: 'Number', value: event.callerIdNumber },
-              { title: 'Name', value: event.callerIdName || 'Unknown' },
-              { title: 'Time', value: localTime },
-              { title: 'Dialed', value: event.calleeIdNumber || '—' },
-              { title: 'Call ID', value: event.callID },
-            ],
-          },
-        ],
-        actions: [
-          { type: 'Action.OpenUrl', title: 'Call Back', url: `tel:${event.callerIdNumber}` },
-        ],
-      },
-    }],
-  };
-
-  const resp = await fetch(TEAMS_WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(card),
-  });
-
-  if (!resp.ok) {
-    console.error('Teams post failed', resp.status, await resp.text());
-    return res.status(502).send('teams_failed');
+  try {
+    await appendMissedCallToExcel(event);
+    return res.status(200).send('appended');
+  } catch (e) {
+    console.error('Excel append error', e);
+    return res.status(502).send('excel_error');
   }
-
-  return res.status(200).send('posted');
 });
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
